@@ -1,12 +1,21 @@
-"""Embedding function factory with hardware acceleration.
+"""Embedding function factory with hardware acceleration and pluggable providers.
 
-Returns a ChromaDB-compatible embedding function bound to a user-selected
-ONNX Runtime execution provider. The same ``all-MiniLM-L6-v2`` model and
-384-dim vectors ChromaDB ships by default are reused, so switching device
-does not invalidate existing palaces.
+Routing (driven by ``MEMPALACE_EMBEDDING_PROVIDER``):
 
-Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
-in ``~/.mempalace/config.json``):
+* ``voyage`` / ``voyageai``       — :class:`VoyageEmbeddingFunction`, API-backed
+  with on-disk content-addressable cache. Requires ``VOYAGE_API_KEY``. BYOK,
+  opt-in only.
+* ``sentence-transformers``       — local ST model (default
+  ``mixedbread-ai/mxbai-embed-large-v1``). Honours ``MEMPALACE_EMBEDDING_MODEL``
+  and ``MEMPALACE_EMBEDDING_DEVICE`` (mps/cuda/cpu auto-detected).
+* unset / anything else (default) — ChromaDB's bundled ``all-MiniLM-L6-v2``
+  via ONNX Runtime, with hardware acceleration. The same 384-dim vectors
+  ChromaDB ships by default are reused, so switching device does not
+  invalidate existing palaces. **This is the project default** — voyage and
+  ST paths are explicit opt-ins.
+
+Supported devices for the default ONNX path (env ``MEMPALACE_EMBEDDING_DEVICE``
+or ``embedding_device`` in ``~/.mempalace/config.json``):
 
 * ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
 * ``cpu`` — force CPU (the historical default)
@@ -16,14 +25,21 @@ in ``~/.mempalace/config.json``):
 
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
+Voyage misconfiguration (e.g. missing API key) is a hard error and is **not**
+silently fallen back, so users always know when their explicit provider
+choice failed.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_VOYAGE_MODEL = "voyage-code-3"
+DEFAULT_ST_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
@@ -116,13 +132,104 @@ def _build_ef_class():
     return _MempalaceONNX
 
 
+def _detect_st_device() -> str:
+    """Return 'mps' on Apple Silicon, 'cuda' if available, else 'cpu'.
+
+    Used only by the sentence-transformers path; the default ONNX path has
+    its own ``_resolve_providers`` device negotiation.
+    """
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _get_voyage_ef():
+    """Build a Voyage AI embedding function. Hard-fails on misconfiguration."""
+    from .voyage_ef import VoyageEmbeddingFunction
+
+    model = os.environ.get("MEMPALACE_EMBEDDING_MODEL", DEFAULT_VOYAGE_MODEL)
+    ef = VoyageEmbeddingFunction(model=model)
+    logger.info("Using Voyage embedding model %s", model)
+    return ef
+
+
+def _get_st_ef(device_hint: Optional[str] = None):
+    """Build a sentence-transformers EF. Returns None to fall back to ONNX default."""
+    model_name = os.environ.get("MEMPALACE_EMBEDDING_MODEL", DEFAULT_ST_MODEL)
+
+    if model_name.lower() in ("", "default", "chroma-default"):
+        return None
+
+    try:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+    except Exception as exc:
+        logger.warning(
+            "SentenceTransformerEmbeddingFunction unavailable (%s); falling back to ONNX default",
+            exc,
+        )
+        return None
+
+    device = device_hint or os.environ.get("MEMPALACE_EMBEDDING_DEVICE") or _detect_st_device()
+    try:
+        ef = SentenceTransformerEmbeddingFunction(model_name=model_name, device=device)
+        logger.info("Using sentence-transformers %s on device %s", model_name, device)
+        return ef
+    except Exception as exc:
+        logger.warning(
+            "Failed to load sentence-transformers %s on %s (%s); falling back to ONNX default",
+            model_name,
+            device,
+            exc,
+        )
+        return None
+
+
 def get_embedding_function(device: Optional[str] = None):
-    """Return a cached embedding function bound to the requested device.
+    """Return a cached embedding function based on provider + device config.
+
+    Provider is selected by ``MEMPALACE_EMBEDDING_PROVIDER``:
+
+    * ``voyage`` → :class:`VoyageEmbeddingFunction` (BYOK, hard-fails on
+      misconfig)
+    * ``sentence-transformers`` → local ST model; ``device`` is forwarded to
+      ST and falls back to the ONNX default if ST loading fails
+    * unset / other → ONNX-accelerated MiniLM (project default; preserves
+      palace compatibility)
 
     ``device=None`` reads from :class:`MempalaceConfig.embedding_device`.
     The returned function is shared across calls with the same resolved
     provider list so we only pay model-load cost once per process.
     """
+    provider = os.environ.get("MEMPALACE_EMBEDDING_PROVIDER", "").strip().lower()
+
+    if provider in ("voyage", "voyageai"):
+        cached = _EF_CACHE.get(("__voyage__",))
+        if cached is not None:
+            return cached
+        # Voyage misconfig is a hard error — never silently fall back.
+        ef = _get_voyage_ef()
+        _EF_CACHE[("__voyage__",)] = ef
+        return ef
+
+    if provider in ("sentence-transformers", "st"):
+        cache_key = ("__st__", os.environ.get("MEMPALACE_EMBEDDING_MODEL", DEFAULT_ST_MODEL))
+        cached = _EF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        st_ef = _get_st_ef(device_hint=device)
+        if st_ef is not None:
+            _EF_CACHE[cache_key] = st_ef
+            return st_ef
+        # Fall through to ONNX default if ST failed to load.
+
+    # Default path: ONNX-accelerated MiniLM (preserves palace compatibility).
     if device is None:
         from .config import MempalaceConfig
 
