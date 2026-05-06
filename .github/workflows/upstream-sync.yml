@@ -1,0 +1,206 @@
+name: Upstream Sync
+
+# Daily check for new MemPalace upstream releases. When a new release tag
+# appears that voyage-backend doesn't contain, merge it in, run tests, and
+# either push directly to voyage-backend (green) or open an issue (conflict
+# or test failure).
+#
+# No PRs created — fork is private/personal.
+# No force-push — always fast-forward or merge-commit.
+# No auto-merge of broken code — failed tests block the push.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily 06:00 UTC
+  workflow_dispatch:       # manual trigger button on Actions tab
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: MemPalace/mempalace
+  TARGET_BRANCH: voyage-backend
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0   # need full history + tags for merge-base
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream --tags --prune
+
+      - name: Resolve latest upstream release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release view --repo "${UPSTREAM_REPO}" --json tagName,isPrerelease,isDraft \
+                   --jq 'select(.isPrerelease==false and .isDraft==false) | .tagName')
+          if [ -z "$LATEST" ]; then
+            echo "No non-prerelease release found upstream — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Latest upstream release: $LATEST"
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already synced
+        id: check
+        if: steps.latest.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          if git merge-base --is-ancestor "refs/tags/${TAG}" HEAD; then
+            echo "voyage-backend already contains ${TAG} — nothing to do."
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt merge
+        id: merge
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          set +e   # we want to handle conflict ourselves
+          TAG="${{ steps.latest.outputs.tag }}"
+          git merge "refs/tags/${TAG}" --no-ff \
+            -m "chore: sync upstream ${TAG}"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "merge_status=conflict" >> "$GITHUB_OUTPUT"
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            {
+              echo 'conflict_files<<EOF'
+              echo "$CONFLICTS"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            exit 0   # don't fail the step — we file an issue below
+          fi
+          echo "merge_status=clean" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        id: tests
+        if: steps.merge.outputs.merge_status == 'clean'
+        run: |
+          set +e
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pytest tests/ -q --ignore=tests/benchmarks 2>&1 | tee pytest.out
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "tests_status=fail" >> "$GITHUB_OUTPUT"
+            # Capture last 200 lines for the issue body
+            tail -n 200 pytest.out > pytest.tail
+          else
+            echo "tests_status=pass" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+        env:
+          MEMPALACE_EMBEDDING_PROVIDER: default
+
+      - name: Push merged branch
+        if: steps.tests.outputs.tests_status == 'pass'
+        run: |
+          git push origin "${TARGET_BRANCH}"
+          echo "::notice title=Synced::voyage-backend now contains ${{ steps.latest.outputs.tag }}"
+
+      - name: Open conflict issue
+        if: steps.merge.outputs.merge_status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          TITLE="Upstream sync conflict: ${TAG}"
+          # Idempotency: skip if an open issue with this title already exists
+          EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already open for ${TAG} — skipping."
+            exit 0
+          fi
+          BODY=$(cat <<EOF
+          Automated upstream sync hit a merge conflict.
+
+          **Upstream tag:** \`${TAG}\`
+          **Target branch:** \`${TARGET_BRANCH}\`
+
+          ### Conflicting files
+          \`\`\`
+          ${{ steps.merge.outputs.conflict_files }}
+          \`\`\`
+
+          ### Resolve locally
+          \`\`\`bash
+          git fetch upstream --tags
+          git switch ${TARGET_BRANCH}
+          git merge refs/tags/${TAG}
+          # …resolve conflicts in the files above…
+          git commit
+          git push origin ${TARGET_BRANCH}
+          \`\`\`
+
+          The branch on \`origin\` was **not** modified by this run.
+          EOF
+          )
+          gh issue create --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
+
+      - name: Open test-failure issue
+        if: steps.tests.outputs.tests_status == 'fail'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          TITLE="Upstream sync test failure: ${TAG}"
+          EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already open for ${TAG} — skipping."
+            exit 0
+          fi
+          PYTEST_TAIL=$(cat pytest.tail 2>/dev/null || echo "(pytest.tail not found)")
+          BODY=$(cat <<EOF
+          Merged upstream \`${TAG}\` cleanly into \`${TARGET_BRANCH}\`, but pytest failed.
+
+          The merge commit was **not** pushed. Branch on \`origin\` is unchanged.
+
+          ### Last 200 lines of pytest output
+          \`\`\`
+          ${PYTEST_TAIL}
+          \`\`\`
+
+          ### Reproduce locally
+          \`\`\`bash
+          git fetch upstream --tags
+          git switch -c sync-debug ${TARGET_BRANCH}
+          git merge refs/tags/${TAG}
+          pip install -e ".[dev]"
+          pytest tests/ --ignore=tests/benchmarks
+          \`\`\`
+          EOF
+          )
+          gh issue create --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Upstream Sync Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Latest upstream tag: \`${{ steps.latest.outputs.tag || 'n/a' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Needs sync: \`${{ steps.check.outputs.needs_sync || 'n/a' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Merge status: \`${{ steps.merge.outputs.merge_status || 'n/a' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tests: \`${{ steps.tests.outputs.tests_status || 'n/a' }}\`" >> "$GITHUB_STEP_SUMMARY"
