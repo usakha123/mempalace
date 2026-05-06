@@ -49,6 +49,11 @@
 STATE_DIR="$HOME/.mempalace/hook_state"
 mkdir -p "$STATE_DIR"
 
+# Source palace runtime env (VOYAGE_API_KEY, MEMPALACE_EMBEDDING_PROVIDER, ...)
+# so the miner subprocess uses the same embedding provider as the MCP server.
+# See mempal_save_hook.sh for the rationale.
+[ -f "$HOME/.mempalace/env" ] && . "$HOME/.mempalace/env"
+
 # Optional: project directory (code / notes / docs) to also mine before
 # compaction. Mined with `--mode projects`. The conversation transcript
 # is always mined regardless — this is purely additive.

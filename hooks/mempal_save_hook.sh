@@ -56,6 +56,13 @@ SAVE_INTERVAL=15  # Save every N human messages (adjust to taste)
 STATE_DIR="$HOME/.mempalace/hook_state"
 mkdir -p "$STATE_DIR"
 
+# Source palace runtime env (VOYAGE_API_KEY, MEMPALACE_EMBEDDING_PROVIDER, ...)
+# so the miner subprocess uses the same embedding provider as the MCP server.
+# Without this, hooks default to whatever embedding.py picks (historically:
+# sentence-transformers / mxbai 1024-dim) while the MCP writes voyage-code-3
+# vectors into the same collection — silent semantic drift across writers.
+[ -f "$HOME/.mempalace/env" ] && . "$HOME/.mempalace/env"
+
 # Optional: project directory (code / notes / docs) to also mine each
 # save trigger. Mined with `--mode projects`. The conversation transcript
 # is always mined regardless — this is purely additive.
