@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_VOYAGE_MODEL = "voyage-code-3"
 DEFAULT_ST_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 
+# Eager-register the Voyage embedding function with chromadb when the user has
+# opted into voyage. Without this, ``_get_collection()`` for an EXISTING palace
+# (built with voyage) raises "Embedding function voyage not found" during
+# ``upsert``, because chromadb tries to rebuild the EF from the persisted
+# config but its ``known_embedding_functions`` registry was never populated.
+# The lazy import inside ``_get_voyage_ef()`` fires only when CREATING a
+# collection — too late for hook subprocesses, MCP cold starts, and CLI
+# commands that open the existing collection first.
+if os.environ.get("MEMPALACE_EMBEDDING_PROVIDER", "").strip().lower() in ("voyage", "voyageai"):
+    try:
+        from . import voyage_ef  # noqa: F401  -- side-effect: registers EF with chroma
+    except Exception as _exc:  # pragma: no cover - voyage extras may be absent
+        logger.warning("eager voyage_ef registration failed: %s", _exc)
+
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
     "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
