@@ -130,8 +130,8 @@ jobs:
           TITLE="Upstream sync conflict: ${TAG}"
           # Idempotency: skip if an open issue with this title already exists
           # Ensure label exists (idempotent — first run on a fresh fork won't have it)
-          gh label create upstream-sync --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
+          gh label create upstream-sync --repo "$GITHUB_REPOSITORY" --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open for ${TAG} — skipping."
             exit 0
@@ -160,7 +160,7 @@ jobs:
           The branch on \`origin\` was **not** modified by this run.
           EOF
           )
-          gh issue create --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
 
       - name: Open test-failure issue
         if: steps.tests.outputs.tests_status == 'fail'
@@ -171,8 +171,8 @@ jobs:
           TAG="${{ steps.latest.outputs.tag }}"
           TITLE="Upstream sync test failure: ${TAG}"
           # Ensure label exists (idempotent — first run on a fresh fork won't have it)
-          gh label create upstream-sync --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
-          EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
+          gh label create upstream-sync --repo "$GITHUB_REPOSITORY" --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open for ${TAG} — skipping."
             exit 0
@@ -198,7 +198,7 @@ jobs:
           \`\`\`
           EOF
           )
-          gh issue create --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "${TITLE}" --body "${BODY}" --label "upstream-sync"
 
       - name: Summary
         if: always()
