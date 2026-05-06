@@ -129,6 +129,8 @@ jobs:
           TAG="${{ steps.latest.outputs.tag }}"
           TITLE="Upstream sync conflict: ${TAG}"
           # Idempotency: skip if an open issue with this title already exists
+          # Ensure label exists (idempotent — first run on a fresh fork won't have it)
+          gh label create upstream-sync --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
           EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open for ${TAG} — skipping."
@@ -168,6 +170,8 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.latest.outputs.tag }}"
           TITLE="Upstream sync test failure: ${TAG}"
+          # Ensure label exists (idempotent — first run on a fresh fork won't have it)
+          gh label create upstream-sync --color BFD4F2 --description "Auto-managed by upstream-sync workflow" 2>/dev/null || true
           EXISTING=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number --jq '.[0].number // ""')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open for ${TAG} — skipping."
