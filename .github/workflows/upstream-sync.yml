@@ -38,6 +38,17 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Set up Python
+        # Without this, the runner's /usr/bin/python and pip-installed pytest
+        # disagree on site-packages location, so test subprocesses that use
+        # ``sys.executable`` (e.g. tests/test_mcp_stdio_protection.py) can't
+        # import ``chromadb``. setup-python provisions a clean isolated env
+        # where pip-installed deps are visible to ``sys.executable``.
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: 'pip'
+
       - name: Add upstream remote and fetch
         run: |
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
@@ -100,8 +111,8 @@ jobs:
         run: |
           set +e
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          pytest tests/ -q --ignore=tests/benchmarks 2>&1 | tee pytest.out
+          python -m pip install -e ".[dev]"
+          python -m pytest tests/ -q --ignore=tests/benchmarks 2>&1 | tee pytest.out
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             echo "tests_status=fail" >> "$GITHUB_OUTPUT"
