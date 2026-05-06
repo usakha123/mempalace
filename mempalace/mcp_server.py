@@ -49,6 +49,7 @@ import hashlib  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
+from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
@@ -57,6 +58,8 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
+from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
+
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
@@ -126,7 +129,7 @@ _vector_disabled_reason = ""
 # Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
 # parsing happy — PEP 604 unions in annotations only became unconditional
 # at module-eval time in 3.10.
-_vector_capacity_status = None  # type: Optional[dict]
+_vector_capacity_status: Optional[dict] = None
 
 
 def _refresh_vector_disabled_flag() -> None:
@@ -284,14 +287,22 @@ def _get_collection(create=False):
             # palaces whose collections were created before this fix (the
             # runtime config does not persist cross-process in chromadb 1.5.x,
             # so the retrofit runs every time _get_collection opens a cache).
-            raw = client.get_or_create_collection(
-                _config.collection_name,
-                metadata={
-                    "hnsw:space": "cosine",
-                    "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
-                },
-            )
+            #
+            # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
+            # is called with metadata that differs from what's stored. The split
+            # below skips the metadata-comparison codepath for existing
+            # collections, mirroring the backend-layer fix from #1262.
+            try:
+                raw = client.get_collection(_config.collection_name)
+            except _ChromaNotFoundError:
+                raw = client.create_collection(
+                    _config.collection_name,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                )
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
@@ -632,9 +643,7 @@ def tool_search(
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
-    col = _get_collection()
-    if not col:
-        return _no_palace()
+    _refresh_vector_disabled_flag()
     if _vector_disabled:
         # Without a usable HNSW we can't compute cosine similarity for
         # near-duplicate detection. Report the limitation rather than
@@ -646,9 +655,12 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "vector_disabled": True,
             "vector_disabled_reason": _vector_disabled_reason,
             "hint": (
-                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+                "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
+    col = _get_collection()
+    if not col:
+        return _no_palace()
     try:
         results = col.query(
             query_texts=[content],

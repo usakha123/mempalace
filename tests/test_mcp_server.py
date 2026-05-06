@@ -514,6 +514,25 @@ class TestWriteTools:
         )
         assert result["is_duplicate"] is False
 
+    def test_check_duplicate_short_circuits_when_vector_disabled(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "hnsw_capacity_status",
+            lambda *_args, **_kwargs: {"diverged": True, "message": "capacity mismatch"},
+        )
+
+        def fail_get_collection():
+            raise AssertionError("_get_collection must not run when vector search is disabled")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", fail_get_collection)
+        result = mcp_server.tool_check_duplicate("content")
+
+        assert result["is_duplicate"] is False
+        assert result["vector_disabled"] is True
+        assert result["vector_disabled_reason"] == "capacity mismatch"
+
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
@@ -874,3 +893,48 @@ class TestCacheInvalidation:
         assert result["success"] is True
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
+
+    def test_get_collection_create_true_avoids_get_or_create_on_reopen(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for the MCP-server half of #1262.
+
+        ChromaDB 1.5.x's Rust bindings SIGSEGV when
+        ``client.get_or_create_collection`` is called with metadata that
+        differs from the collection's stored metadata. The Stop hook
+        path (``tool_diary_write`` -> ``_get_collection(create=True)``)
+        was reaching that codepath on every session-end; #1262 fixed
+        the equivalent crash class in ``ChromaBackend`` but left this
+        site untouched. ``_get_collection(create=True)`` must call
+        ``client.get_collection`` first and only fall back to
+        ``client.create_collection`` when the collection does not yet
+        exist on disk.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        col1 = mcp_server._get_collection(create=True)
+        assert col1 is not None
+
+        client = mcp_server._client_cache
+        assert client is not None
+
+        # Patch at the class level — chromadb's mtime-change detection
+        # may rebuild the client between calls, so an instance-level
+        # spy would not survive.
+        client_cls = type(client)
+        calls: list[tuple] = []
+
+        def _spy(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError(
+                "get_or_create_collection must not be called on reopen "
+                "(SIGSEGV path on metadata mismatch)"
+            )
+
+        monkeypatch.setattr(client_cls, "get_or_create_collection", _spy)
+        mcp_server._collection_cache = None
+
+        col2 = mcp_server._get_collection(create=True)
+        assert col2 is not None
+        assert calls == [], f"get_or_create_collection was called: {calls}"
