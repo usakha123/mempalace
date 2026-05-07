@@ -81,6 +81,77 @@ mempalace mine <dir> --mode convos # Mine conversation transcripts only
 
 The hooks resolve the repo root automatically from their own path, so they work regardless of where you install the repo.
 
+## LLM-Assisted Hooks (Local Ollama)
+
+The Stop and PreCompact hooks can call a **local** LLM (Ollama, default model `gemma4:e4b`) to enrich the metadata they save. **No content ever leaves your machine** — local-first is non-negotiable.
+
+What the LLM does:
+
+| Piece | Hook | What it adds |
+|-------|------|--------------|
+| **Themes** | Stop | LLM-extracted topic phrases joined with keyword themes in the AAAK envelope |
+| **Diary suffix** | Stop | Appends `summary:.../decisions:.../blockers:.../rating:★★★★` to the CHECKPOINT line |
+| **KG triples** | PreCompact | Extracts up to 12 `subject → predicate → object` triples (allow-listed predicates only, confidence ≥ 0.7) and writes them to the knowledge graph |
+
+Verbatim drawers are **never** touched by the LLM — only metadata fields. If Ollama isn't running, every piece falls back to the deterministic path silently and the hook still completes.
+
+### Defaults
+
+All three pieces are **on by default** because the implementation caches a `__unavailable__` sentinel after the first failed probe — missing Ollama costs one timeout per session, not per hook fire.
+
+### Prerequisite
+
+```bash
+ollama pull gemma4:e4b
+```
+
+Any other Ollama model works too — set `hook_llm_model` to override.
+
+### Config keys (`~/.mempalace/config.json`)
+
+```json
+{
+  "hooks": {
+    "llm_themes": true,
+    "llm_diary": true,
+    "llm_precompact_kg": true,
+    "llm_provider": "ollama",
+    "llm_model": "gemma4:e4b",
+    "llm_timeout_s": 10
+  }
+}
+```
+
+### Env overrides
+
+Env vars take precedence over the config file:
+
+| Variable | Effect |
+|----------|--------|
+| `MEMPALACE_HOOK_LLM_THEMES` | `0`/`false` to disable LLM topic extraction in Stop |
+| `MEMPALACE_HOOK_LLM_DIARY` | `0`/`false` to disable the CHECKPOINT suffix in Stop |
+| `MEMPALACE_HOOK_LLM_PRECOMPACT_KG` | `0`/`false` to disable KG triple extraction in PreCompact |
+| `MEMPALACE_HOOK_LLM_PROVIDER` | Provider name (currently only `ollama`) |
+| `MEMPALACE_HOOK_LLM_MODEL` | Model identifier passed to the provider |
+| `MEMPALACE_HOOK_LLM_TIMEOUT_S` | Per-call timeout in seconds (integer) |
+
+Quick disable for one session:
+
+```bash
+MEMPALACE_HOOK_LLM_THEMES=0 \
+MEMPALACE_HOOK_LLM_DIARY=0 \
+MEMPALACE_HOOK_LLM_PRECOMPACT_KG=0 \
+claude
+```
+
+### KG predicate allow-list
+
+Only these predicates are accepted from the LLM for PreCompact KG extraction (anything else is dropped):
+
+`works_on`, `assigned_to`, `blocked_by`, `decided`, `decides`, `mentions`, `discusses`, `depends_on`, `related_to`, `owns`, `uses`, `uses_tool`, `reports_to`, `asked_about`, `completed`
+
+Subject and object strings are run through `sanitize_kg_value`; predicate through `sanitize_name`. Triples are written with `valid_from = today` and `source_closet = "precompact-hook"`.
+
 ## How It Works (Technical)
 
 ### Save Hook (Stop event)
