@@ -599,6 +599,142 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
     return merged
 
 
+# ── Piece 1: LLM-composed diary AAAK section ──────────────────────────────
+# Produces a structured AAAK suffix appended to the mechanical CHECKPOINT
+# header. Suffix shape (single line, pipe-delimited):
+#
+#   summary:<one-line arc>|decisions:<a;b>|blockers:<x;y>|rating:★N
+#
+# Why the pipe/semicolon split: the existing CHECKPOINT envelope already
+# uses ``|`` as a field separator, and the AAAK dialect uses ``;`` for
+# multi-value entries inside a field. Mirroring that here keeps any
+# downstream parser (dialect.py / search) unchanged.
+
+# Predicates allowed for the PreCompact KG extraction. Anything else the
+# LLM emits gets dropped silently rather than poisoning the graph with
+# hallucinated relationship types. Keep this set conservative — it's
+# easier to add predicates than to hunt down bad triples later.
+_HOOK_KG_ALLOWED_PREDICATES = frozenset(
+    [
+        "works_on",
+        "assigned_to",
+        "blocked_by",
+        "decided",
+        "decides",
+        "mentions",
+        "discusses",
+        "depends_on",
+        "related_to",
+        "owns",
+        "uses",
+        "uses_tool",
+        "reports_to",
+        "asked_about",
+        "completed",
+    ]
+)
+
+
+def _llm_compose_diary_suffix(messages: list[str], themes: list[str]) -> str | None:
+    """Ask gemma4 for a structured AAAK suffix to attach to the diary CHECKPOINT.
+
+    Returns the suffix string (no leading pipe) or ``None`` on any failure.
+    Caller appends it to the mechanical envelope; the mechanical
+    ``recent:...`` line is preserved as a fallback when this returns None
+    so we never lose checkpoint searchability on a flaky LLM.
+    """
+    provider = _get_hook_llm()
+    if provider is None:
+        return None
+    if not messages:
+        return None
+
+    sample = "\n".join(f"- {m[:200]}" for m in messages[-30:])
+    theme_hint = ", ".join(themes[:5]) if themes else "none yet"
+    system = (
+        "You compress chat sessions into one-line AAAK diary entries. "
+        "Return ONLY a JSON object with this exact shape: "
+        '{"summary": "...", "decisions": ["..."], "blockers": ["..."], '
+        '"rating": 1..5}. '
+        "summary: one short sentence describing the arc. "
+        "decisions: 0-5 short bare phrases of choices made. "
+        "blockers: 0-5 short bare phrases of unresolved obstacles. "
+        "rating: integer 1-5 reflecting how memorable / important this "
+        "session is for future recall. No prose outside the JSON."
+    )
+    user = f"Themes so far: {theme_hint}\n\nMessages:\n{sample}\n\nReturn JSON only."
+
+    try:
+        resp = provider.classify(system=system, user=user, json_mode=True)
+    except Exception as exc:
+        _log(f"hook_llm: diary classify failed: {exc}")
+        return None
+
+    raw = (resp.text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    # Helpers — strict shape checks. We never raise; bad fields just become
+    # empty/missing in the suffix. The suffix itself remains well-formed
+    # so downstream parsers don't see a half-broken pipe-line.
+    summary = parsed.get("summary")
+    if not isinstance(summary, str):
+        summary = ""
+    summary = summary.strip().replace("|", "/").replace("\n", " ")[:240]
+
+    def _list_str(field: str, cap: int) -> list[str]:
+        raw_list = parsed.get(field)
+        if not isinstance(raw_list, list):
+            return []
+        items: list[str] = []
+        for v in raw_list:
+            if not isinstance(v, str):
+                continue
+            cleaned = v.strip().replace("|", "/").replace(";", ",").replace("\n", " ")
+            if cleaned:
+                items.append(cleaned[:120])
+            if len(items) >= cap:
+                break
+        return items
+
+    decisions = _list_str("decisions", 5)
+    blockers = _list_str("blockers", 5)
+
+    rating_raw = parsed.get("rating")
+    try:
+        rating = int(rating_raw)
+    except (TypeError, ValueError):
+        rating = 0
+    rating = max(0, min(5, rating))
+    stars = "★" * rating if rating else ""
+
+    parts: list[str] = []
+    if summary:
+        parts.append(f"summary:{summary}")
+    if decisions:
+        parts.append("decisions:" + ";".join(decisions))
+    if blockers:
+        parts.append("blockers:" + ";".join(blockers))
+    if stars:
+        parts.append(f"rating:{stars}")
+    if not parts:
+        return None
+    return "|".join(parts)
+
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -627,6 +763,20 @@ def _save_diary_direct(
         f"CHECKPOINT:{now.strftime('%Y-%m-%d')}|session:{session_id}"
         f"|msgs:{len(messages)}|recent:{topics}"
     )
+
+    # Optional LLM-enhanced AAAK suffix. We *append* rather than replace
+    # the mechanical "recent:..." segment — if a downstream tool only
+    # knows the original 4-field shape it still parses cleanly, and any
+    # LLM hallucination is confined to its own labelled fields.
+    try:
+        from .config import MempalaceConfig
+
+        if MempalaceConfig().hook_llm_diary:
+            suffix = _llm_compose_diary_suffix(messages, themes)
+            if suffix:
+                entry = f"{entry}|{suffix}"
+    except Exception as exc:
+        _log(f"hook_llm: diary suffix skipped: {exc}")
 
     try:
         from .mcp_server import tool_diary_write
@@ -866,6 +1016,155 @@ def hook_session_start(data: dict, harness: str):
     _output({})
 
 
+# ── Piece 3: PreCompact KG extraction ─────────────────────────────────────
+# Pulls (subject, predicate, object) triples out of the about-to-be-compacted
+# transcript and lands them in the knowledge graph before they're lost.
+# Mining picks up drawer content from disk later, but live-conversation
+# entities + relationships die with the compaction window unless captured
+# here.
+
+
+def _kg_extract_from_transcript(transcript_path: str) -> list[dict]:
+    """Ask gemma4 for KG triples from the recent transcript window.
+
+    Returns a list of ``{"subject", "predicate", "object", "confidence"}``
+    dicts that passed validation. Predicates are clamped to
+    :data:`_HOOK_KG_ALLOWED_PREDICATES`; anything outside that set is
+    dropped silently rather than allowed to invent novel relationship
+    types.
+
+    Never raises — PreCompact must not block compaction on an LLM error.
+    """
+    provider = _get_hook_llm()
+    if provider is None:
+        return []
+    if not transcript_path:
+        return []
+
+    messages = _extract_recent_messages(transcript_path, count=60)
+    if not messages:
+        return []
+
+    sample = "\n".join(f"- {m[:200]}" for m in messages[-50:])
+    allowed = ", ".join(sorted(_HOOK_KG_ALLOWED_PREDICATES))
+    system = (
+        "You extract knowledge-graph triples from chat. Return ONLY a JSON "
+        'object of shape {"triples": [{"subject":"S","predicate":"P",'
+        '"object":"O","confidence":0.0-1.0}, ...]}. '
+        f"Predicate MUST be one of: {allowed}. Drop any fact that doesn't "
+        "fit those predicates. Subject and object should be concrete "
+        "entities (people, projects, files, tools) — never opinions or "
+        "abstract claims. Confidence is your honest 0.0-1.0 estimate. "
+        "Up to 12 triples. No prose outside the JSON."
+    )
+    user = f"Messages:\n{sample}\n\nReturn JSON only."
+
+    try:
+        resp = provider.classify(system=system, user=user, json_mode=True)
+    except Exception as exc:
+        _log(f"hook_llm: kg classify failed: {exc}")
+        return []
+
+    raw = (resp.text or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    triples = parsed.get("triples") if isinstance(parsed, dict) else None
+    if not isinstance(triples, list):
+        return []
+
+    try:
+        from .config import sanitize_kg_value, sanitize_name
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for t in triples:
+        if not isinstance(t, dict):
+            continue
+        subject = t.get("subject")
+        predicate = t.get("predicate")
+        obj = t.get("object")
+        confidence = t.get("confidence", 0.0)
+        if not (isinstance(subject, str) and isinstance(predicate, str) and isinstance(obj, str)):
+            continue
+        try:
+            confidence_f = float(confidence)
+        except (TypeError, ValueError):
+            confidence_f = 0.0
+        # Confidence floor — gemma is quite happy to invent low-confidence
+        # connections. 0.7 keeps the graph high-signal at the cost of
+        # missing weakly-stated facts (which we'd rather catch via mining
+        # of the actual drawer content later anyway).
+        if confidence_f < 0.7:
+            continue
+        pred_norm = predicate.strip().lower()
+        if pred_norm not in _HOOK_KG_ALLOWED_PREDICATES:
+            continue
+        try:
+            subject_v = sanitize_kg_value(subject, "subject")
+            object_v = sanitize_kg_value(obj, "object")
+            predicate_v = sanitize_name(pred_norm, "predicate")
+        except ValueError:
+            continue
+        out.append(
+            {
+                "subject": subject_v,
+                "predicate": predicate_v,
+                "object": object_v,
+                "confidence": confidence_f,
+            }
+        )
+        if len(out) >= 12:
+            break
+    return out
+
+
+def _kg_apply_triples(triples: list[dict]) -> int:
+    """Persist accepted triples via the in-process KG writer.
+
+    Returns the number of triples actually inserted. Failures inside
+    individual ``tool_kg_add`` calls are logged but never raised — one
+    bad triple should not kill the rest.
+    """
+    if not triples:
+        return 0
+    try:
+        from .mcp_server import tool_kg_add
+    except Exception as exc:
+        _log(f"hook_llm: kg_add import failed: {exc}")
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    inserted = 0
+    for t in triples:
+        try:
+            res = tool_kg_add(
+                subject=t["subject"],
+                predicate=t["predicate"],
+                object=t["object"],
+                valid_from=today,
+                source_closet="precompact-hook",
+            )
+            if res.get("success"):
+                inserted += 1
+            else:
+                _log(f"hook_llm: kg_add rejected {t}: {res.get('error')}")
+        except Exception as exc:
+            _log(f"hook_llm: kg_add raised on {t}: {exc}")
+    return inserted
+
+
 def hook_precompact(data: dict, harness: str):
     """Precompact hook: mine transcript synchronously, then allow compaction."""
     parsed = _parse_harness_input(data, harness)
@@ -877,6 +1176,21 @@ def hook_precompact(data: dict, harness: str):
     # Capture tool output via our normalize path before compaction loses it
     if transcript_path:
         _ingest_transcript(transcript_path)
+
+    # Optional KG extraction over the about-to-be-compacted window. Done
+    # before _mine_sync because compaction can fire mid-mine and we want
+    # the high-confidence triples committed first. Latency budget is
+    # bounded by hook_llm_timeout_s (default 10s).
+    try:
+        from .config import MempalaceConfig
+
+        if transcript_path and MempalaceConfig().hook_llm_precompact_kg:
+            triples = _kg_extract_from_transcript(transcript_path)
+            inserted = _kg_apply_triples(triples)
+            if inserted:
+                _log(f"hook_llm: precompact KG inserted {inserted} triple(s)")
+    except Exception as exc:
+        _log(f"hook_llm: precompact KG skipped: {exc}")
 
     # Mine MEMPAL_DIR synchronously so project data lands before
     # compaction proceeds. Transcript convos were already kicked off

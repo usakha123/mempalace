@@ -248,3 +248,234 @@ def test_extract_themes_falls_back_to_keyword_on_llm_failure(monkeypatch, llm_on
     _install_provider(monkeypatch, fake)
     out = hooks_cli._extract_themes(["voyage backend embedding"], max_themes=3)
     assert "voyage" in out  # keyword path survived
+
+
+# ── Piece 1: diary suffix composition ──────────────────────────────────────
+
+
+def test_llm_compose_diary_suffix_happy(monkeypatch):
+    fake = FakeProvider(
+        response=json.dumps(
+            {
+                "summary": "Wired gemma4 into Stop hook.",
+                "decisions": ["default-on", "Ollama only"],
+                "blockers": ["awaiting review"],
+                "rating": 4,
+            }
+        )
+    )
+    _install_provider(monkeypatch, fake)
+    suffix = hooks_cli._llm_compose_diary_suffix(["a", "b"], ["hooks", "gemma"])
+    assert suffix.startswith("summary:Wired gemma4 into Stop hook.")
+    assert "decisions:default-on;Ollama only" in suffix
+    assert "blockers:awaiting review" in suffix
+    assert suffix.endswith("rating:★★★★")
+
+
+def test_llm_compose_diary_suffix_strips_pipes_and_newlines(monkeypatch):
+    """Pipe and newline in values would corrupt the AAAK envelope.
+
+    Pipes between top-level fields (``summary:.. | decisions:.. | rating:..``)
+    are the legitimate separators. Pipes/newlines inside any single value
+    must be replaced or downstream parsers would split on them.
+    """
+    fake = FakeProvider(
+        response=json.dumps(
+            {
+                "summary": "first | second\nthird",
+                "decisions": ["alpha|beta"],
+                "blockers": [],
+                "rating": 1,
+            }
+        )
+    )
+    _install_provider(monkeypatch, fake)
+    suffix = hooks_cli._llm_compose_diary_suffix(["x"], [])
+    # Three top-level fields → exactly two pipe separators
+    assert suffix.count("|") == 2
+    # Inline pipes / newlines inside values were rewritten
+    assert "first / second third" in suffix
+    assert "alpha/beta" in suffix
+    assert "\n" not in suffix
+
+
+def test_llm_compose_diary_suffix_clamps_rating(monkeypatch):
+    fake = FakeProvider(
+        response=json.dumps({"summary": "x", "decisions": [], "blockers": [], "rating": 99})
+    )
+    _install_provider(monkeypatch, fake)
+    suffix = hooks_cli._llm_compose_diary_suffix(["x"], [])
+    assert suffix.endswith("rating:★★★★★")  # 5 stars max
+
+
+def test_llm_compose_diary_suffix_returns_none_on_empty_fields(monkeypatch):
+    fake = FakeProvider(
+        response=json.dumps({"summary": "", "decisions": [], "blockers": [], "rating": 0})
+    )
+    _install_provider(monkeypatch, fake)
+    assert hooks_cli._llm_compose_diary_suffix(["x"], []) is None
+
+
+def test_llm_compose_diary_suffix_returns_none_on_garbage(monkeypatch):
+    fake = FakeProvider(response="totally not json")
+    _install_provider(monkeypatch, fake)
+    assert hooks_cli._llm_compose_diary_suffix(["x"], []) is None
+
+
+def test_llm_compose_diary_suffix_returns_none_when_provider_missing(monkeypatch):
+    monkeypatch.setattr(hooks_cli, "_get_hook_llm", lambda: None)
+    assert hooks_cli._llm_compose_diary_suffix(["x"], []) is None
+
+
+# ── Piece 3: KG triple extraction ──────────────────────────────────────────
+
+
+def test_kg_extract_filters_disallowed_predicate(monkeypatch, tmp_path):
+    """Predicates outside the allow-list get dropped silently."""
+    fake = FakeProvider(
+        response=json.dumps(
+            {
+                "triples": [
+                    {
+                        "subject": "Usama",
+                        "predicate": "works_on",
+                        "object": "MemPalace",
+                        "confidence": 0.95,
+                    },
+                    {
+                        "subject": "Usama",
+                        "predicate": "smells_like",  # not allowed
+                        "object": "victory",
+                        "confidence": 0.99,
+                    },
+                ]
+            }
+        )
+    )
+    _install_provider(monkeypatch, fake)
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"role": "user", "content": "Working on MemPalace today."}}) + "\n"
+    )
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: ["msg"])
+
+    triples = hooks_cli._kg_extract_from_transcript(str(transcript))
+    assert len(triples) == 1
+    assert triples[0]["predicate"] == "works_on"
+
+
+def test_kg_extract_filters_low_confidence(monkeypatch, tmp_path):
+    fake = FakeProvider(
+        response=json.dumps(
+            {
+                "triples": [
+                    {"subject": "A", "predicate": "uses", "object": "B", "confidence": 0.4},
+                    {"subject": "C", "predicate": "uses", "object": "D", "confidence": 0.9},
+                ]
+            }
+        )
+    )
+    _install_provider(monkeypatch, fake)
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: ["msg"])
+    triples = hooks_cli._kg_extract_from_transcript("/dev/null")
+    assert len(triples) == 1
+    assert triples[0]["subject"] == "C"
+
+
+def test_kg_extract_drops_unsafe_values(monkeypatch):
+    fake = FakeProvider(
+        response=json.dumps(
+            {
+                "triples": [
+                    {"subject": "A\x00", "predicate": "uses", "object": "B", "confidence": 0.9},
+                    {"subject": "A", "predicate": "uses/etc", "object": "B", "confidence": 0.9},
+                    {"subject": "A", "predicate": "uses", "object": "B", "confidence": 0.9},
+                ]
+            }
+        )
+    )
+    _install_provider(monkeypatch, fake)
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: ["msg"])
+    triples = hooks_cli._kg_extract_from_transcript("/dev/null")
+    assert len(triples) == 1
+    assert triples[0]["subject"] == "A"
+
+
+def test_kg_extract_caps_at_12(monkeypatch):
+    triples_in = [
+        {"subject": f"S{i}", "predicate": "uses", "object": f"O{i}", "confidence": 0.95}
+        for i in range(20)
+    ]
+    fake = FakeProvider(response=json.dumps({"triples": triples_in}))
+    _install_provider(monkeypatch, fake)
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: ["msg"])
+    out = hooks_cli._kg_extract_from_transcript("/dev/null")
+    assert len(out) == 12
+
+
+def test_kg_extract_returns_empty_on_classify_error(monkeypatch):
+    fake = FakeProvider(raise_on_call=RuntimeError("offline"))
+    _install_provider(monkeypatch, fake)
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: ["msg"])
+    assert hooks_cli._kg_extract_from_transcript("/dev/null") == []
+
+
+def test_kg_extract_returns_empty_when_no_messages(monkeypatch):
+    fake = FakeProvider(response=json.dumps({"triples": [{"a": 1}]}))
+    _install_provider(monkeypatch, fake)
+    monkeypatch.setattr(hooks_cli, "_extract_recent_messages", lambda *_a, **_k: [])
+    assert hooks_cli._kg_extract_from_transcript("/some/path") == []
+    assert fake.calls == []
+
+
+def test_kg_apply_triples_calls_tool_kg_add(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_add(**kwargs):
+        captured.append(kwargs)
+        return {"success": True, "triple_id": len(captured)}
+
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("mempalace.mcp_server")
+    fake_mod.tool_kg_add = fake_add
+    monkeypatch.setitem(sys.modules, "mempalace.mcp_server", fake_mod)
+
+    triples = [
+        {"subject": "A", "predicate": "uses", "object": "B", "confidence": 0.9},
+        {"subject": "C", "predicate": "owns", "object": "D", "confidence": 0.85},
+    ]
+    inserted = hooks_cli._kg_apply_triples(triples)
+    assert inserted == 2
+    assert captured[0]["subject"] == "A"
+    assert captured[0]["source_closet"] == "precompact-hook"
+    assert captured[0]["valid_from"]  # date filled in
+
+
+def test_kg_apply_triples_survives_individual_failures(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_add(**_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("first one explodes")
+        return {"success": True, "triple_id": calls["n"]}
+
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("mempalace.mcp_server")
+    fake_mod.tool_kg_add = fake_add
+    monkeypatch.setitem(sys.modules, "mempalace.mcp_server", fake_mod)
+
+    triples = [
+        {"subject": "A", "predicate": "uses", "object": "B"},
+        {"subject": "C", "predicate": "uses", "object": "D"},
+    ]
+    assert hooks_cli._kg_apply_triples(triples) == 1
+
+
+def test_kg_apply_triples_empty_returns_zero():
+    assert hooks_cli._kg_apply_triples([]) == 0
