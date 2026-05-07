@@ -365,6 +365,29 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             return 10
 
+    @property
+    def hook_llm_timeout_kg_s(self) -> int:
+        """Timeout for the PreCompact KG triple extraction LLM call.
+
+        Separate from ``hook_llm_timeout_s`` because KG extraction with
+        gemma4:e4b takes ~40s on consumer hardware vs ~1-8s for themes
+        and diary suffix. Defaults to 60s.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOK_LLM_TIMEOUT_KG_S")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("hooks", {}).get("llm_timeout_kg_s", 60)
+        try:
+            parsed = int(cfg_val)
+            return parsed if parsed > 0 else 60
+        except (TypeError, ValueError):
+            return 60
+
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""
         if "hooks" not in self._file_config:

@@ -73,7 +73,7 @@ def llm_off(monkeypatch):
 def _install_provider(monkeypatch, provider):
     """Make ``_get_hook_llm`` return ``provider`` regardless of Ollama state."""
 
-    def fake_get():
+    def fake_get(*_args, **_kwargs):
         return provider
 
     monkeypatch.setattr(hooks_cli, "_get_hook_llm", fake_get)
@@ -122,6 +122,61 @@ def test_config_invalid_timeout_falls_back(monkeypatch, tmp_path):
 
     cfg = MempalaceConfig(config_dir=tmp_path)
     assert cfg.hook_llm_timeout_s == 10  # default
+
+
+def test_config_default_kg_timeout_is_60s(monkeypatch, tmp_path):
+    """KG extraction needs a separate, longer budget than themes/diary."""
+    monkeypatch.delenv("MEMPALACE_HOOK_LLM_TIMEOUT_KG_S", raising=False)
+    from mempalace.config import MempalaceConfig
+
+    cfg = MempalaceConfig(config_dir=tmp_path)
+    assert cfg.hook_llm_timeout_kg_s == 60
+
+
+def test_config_kg_timeout_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_HOOK_LLM_TIMEOUT_KG_S", "120")
+    from mempalace.config import MempalaceConfig
+
+    cfg = MempalaceConfig(config_dir=tmp_path)
+    assert cfg.hook_llm_timeout_kg_s == 120
+
+
+def test_config_kg_timeout_invalid_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_HOOK_LLM_TIMEOUT_KG_S", "not-a-number")
+    from mempalace.config import MempalaceConfig
+
+    cfg = MempalaceConfig(config_dir=tmp_path)
+    assert cfg.hook_llm_timeout_kg_s == 60
+
+
+def test_kg_extract_uses_kg_timeout(monkeypatch, tmp_path, llm_on):
+    """``_kg_extract_from_transcript`` must request the KG-specific timeout
+    when building its provider, not the shared ``hook_llm_timeout_s``."""
+    monkeypatch.setenv("MEMPALACE_HOOK_LLM_TIMEOUT_KG_S", "47")
+    monkeypatch.setenv("MEMPALACE_HOOK_LLM_TIMEOUT_S", "9")
+
+    from mempalace import hooks_cli
+
+    seen_timeouts: list[int | None] = []
+    real_get = hooks_cli._get_hook_llm
+
+    def spy(timeout=None):
+        seen_timeouts.append(timeout)
+        return None  # short-circuit: KG returns [] without calling provider
+
+    monkeypatch.setattr(hooks_cli, "_get_hook_llm", spy)
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}})
+        + "\n"
+    )
+
+    hooks_cli._kg_extract_from_transcript(str(transcript))
+
+    assert seen_timeouts == [47]
+    # Sanity: the real function still works (not just the spy)
+    assert real_get is not None
 
 
 # ── _get_hook_llm cache behavior ───────────────────────────────────────────

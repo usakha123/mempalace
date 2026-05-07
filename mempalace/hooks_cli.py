@@ -402,12 +402,17 @@ _THEME_STOPWORDS = frozenset(
 _HOOK_LLM_CACHE: dict = {}
 
 
-def _get_hook_llm():
+def _get_hook_llm(timeout: int | None = None):
     """Return a configured LLM provider for hook use, or None on any failure.
 
-    Cached per (provider, model) within the process. Probing ``check_available``
-    once on first build keeps the per-fire latency low — subsequent calls
-    skip the probe and go straight to ``classify``.
+    Cached per (provider, model, timeout) within the process. Probing
+    ``check_available`` once on first build keeps the per-fire latency low —
+    subsequent calls skip the probe and go straight to ``classify``.
+
+    Pass ``timeout`` to override the default ``hook_llm_timeout_s``. Used by
+    ``_kg_extract_from_transcript`` which needs a longer budget than the
+    Stop-hook themes/diary calls. Each unique timeout gets its own cache
+    entry, so an unavailable Ollama at one timeout doesn't poison the other.
     """
     try:
         from .config import MempalaceConfig
@@ -419,7 +424,7 @@ def _get_hook_llm():
         cfg = MempalaceConfig()
         provider_name = cfg.hook_llm_provider
         model = cfg.hook_llm_model
-        timeout = cfg.hook_llm_timeout_s
+        timeout = timeout if timeout is not None else cfg.hook_llm_timeout_s
     except Exception as exc:
         _log(f"hook_llm: config read failed: {exc}")
         return None
@@ -1035,7 +1040,12 @@ def _kg_extract_from_transcript(transcript_path: str) -> list[dict]:
 
     Never raises — PreCompact must not block compaction on an LLM error.
     """
-    provider = _get_hook_llm()
+    try:
+        from .config import MempalaceConfig
+        kg_timeout = MempalaceConfig().hook_llm_timeout_kg_s
+    except Exception:
+        kg_timeout = 60
+    provider = _get_hook_llm(timeout=kg_timeout)
     if provider is None:
         return []
     if not transcript_path:
