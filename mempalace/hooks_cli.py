@@ -387,8 +387,175 @@ _THEME_STOPWORDS = frozenset(
 )
 
 
+# ── Hook LLM scaffolding ──────────────────────────────────────────────────
+# A single lazy provider instance shared across hook fires within a process,
+# so we pay Ollama warmup at most once. Process-level caching is enough —
+# hooks are short-lived (<60s) and we don't share state across fires.
+#
+# ``_get_hook_llm`` returns ``None`` when:
+#   - no hook flag is on (caller does the cheap deterministic path)
+#   - provider build fails (unknown name, missing endpoint, etc.)
+#   - ``check_available()`` reports the model is missing or Ollama is down
+# Returning ``None`` is the contract callers rely on for fallback to
+# deterministic logic. We never raise out of a hook.
+
+_HOOK_LLM_CACHE: dict = {}
+
+
+def _get_hook_llm():
+    """Return a configured LLM provider for hook use, or None on any failure.
+
+    Cached per (provider, model) within the process. Probing ``check_available``
+    once on first build keeps the per-fire latency low — subsequent calls
+    skip the probe and go straight to ``classify``.
+    """
+    try:
+        from .config import MempalaceConfig
+    except Exception as exc:
+        _log(f"hook_llm: config import failed: {exc}")
+        return None
+
+    try:
+        cfg = MempalaceConfig()
+        provider_name = cfg.hook_llm_provider
+        model = cfg.hook_llm_model
+        timeout = cfg.hook_llm_timeout_s
+    except Exception as exc:
+        _log(f"hook_llm: config read failed: {exc}")
+        return None
+
+    cache_key = (provider_name, model, timeout)
+    cached = _HOOK_LLM_CACHE.get(cache_key)
+    if cached is not None:
+        # Sentinel: a previously-failed probe. Don't retry within the process —
+        # Ollama isn't going to come up mid-hook, and retrying just adds
+        # 5s of urlopen timeout to every Stop fire.
+        if cached == "__unavailable__":
+            return None
+        return cached
+
+    try:
+        from .llm_client import get_provider
+    except Exception as exc:
+        _log(f"hook_llm: llm_client import failed: {exc}")
+        _HOOK_LLM_CACHE[cache_key] = "__unavailable__"
+        return None
+
+    try:
+        provider = get_provider(provider_name, model=model, timeout=timeout)
+    except Exception as exc:
+        _log(f"hook_llm: get_provider({provider_name!r}, {model!r}) failed: {exc}")
+        _HOOK_LLM_CACHE[cache_key] = "__unavailable__"
+        return None
+
+    try:
+        ok, msg = provider.check_available()
+    except Exception as exc:
+        _log(f"hook_llm: check_available raised: {exc}")
+        _HOOK_LLM_CACHE[cache_key] = "__unavailable__"
+        return None
+
+    if not ok:
+        _log(f"hook_llm: provider unavailable: {msg}")
+        _HOOK_LLM_CACHE[cache_key] = "__unavailable__"
+        return None
+
+    _HOOK_LLM_CACHE[cache_key] = provider
+    return provider
+
+
+def _llm_themes(messages: list[str], max_themes: int = 7) -> list[str]:
+    """Ask gemma4 for 3-7 topical entities from recent messages.
+
+    Returns ``[]`` on any failure (caller unions with keyword themes).
+    Never raises — hooks must not crash when the LLM is misbehaving.
+
+    Output contract: gemma is asked for JSON ``{"topics": [...]}`` so we
+    can use Ollama's ``format=json`` mode and avoid prose-wrapper parsing
+    headaches. Names are sanitized via :func:`sanitize_name` to drop any
+    hallucinated path-traversal or null-byte payload before they reach
+    drawer metadata.
+    """
+    provider = _get_hook_llm()
+    if provider is None:
+        return []
+    if not messages:
+        return []
+
+    try:
+        from .config import sanitize_name
+    except Exception:
+        return []
+
+    # Trim aggressively — gemma at 4B has a small useful prompt window and
+    # we want this under the per-call timeout budget. Last 30 messages,
+    # 200 chars each ≈ 6KB, well under any reasonable context.
+    sample = "\n".join(f"- {m[:200]}" for m in messages[-30:])
+    system = (
+        "You extract topical entities from chat messages. Return ONLY a JSON "
+        'object of the shape {"topics": ["t1", "t2", ...]}. Each topic is a '
+        "short bare noun or proper noun (1-3 words), no prose, no punctuation, "
+        "no quotes inside the topic strings. 3 to 7 topics. No explanation."
+    )
+    user = f"Messages:\n{sample}\n\nReturn JSON only."
+
+    try:
+        resp = provider.classify(system=system, user=user, json_mode=True)
+    except Exception as exc:
+        _log(f"hook_llm: classify failed: {exc}")
+        return []
+
+    raw = (resp.text or "").strip()
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Some local models still wrap JSON in prose despite ``format=json``.
+        # Cheap recovery: pull the first ``{...}`` block and try once.
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    topics = parsed.get("topics") if isinstance(parsed, dict) else None
+    if not isinstance(topics, list):
+        return []
+
+    out: list[str] = []
+    seen: set = set()
+    for t in topics:
+        if not isinstance(t, str):
+            continue
+        candidate = t.strip().strip("\"'`")
+        if not candidate:
+            continue
+        try:
+            safe = sanitize_name(candidate, field_name="theme")
+        except ValueError:
+            continue
+        key = safe.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(safe)
+        if len(out) >= max_themes:
+            break
+    return out
+
+
 def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
     """Pull 2-3 distinctive topic words from recent messages.
+
+    When ``hook_llm_themes`` is on, gemma4-extracted topics are unioned
+    with the keyword path. Keyword extraction stays as a fallback because
+    code identifiers (function names, file basenames) often beat the LLM
+    on technical sessions, while gemma catches natural-language topics
+    keyword frequency misses.
 
     Note: stopword list is English-only; non-English corpora will produce noisy themes.
     """
@@ -401,7 +568,35 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
             clean = word.strip(".,;:!?\"'`()[]{}#<>/\\-_=+@$%^&*~")
             if len(clean) >= 4 and clean not in _THEME_STOPWORDS and clean.isalpha():
                 words[clean] += 1
-    return [w for w, _ in words.most_common(max_themes)]
+    keyword_themes = [w for w, _ in words.most_common(max_themes)]
+
+    # LLM upgrade — gated, fails silently to keyword path on any error.
+    try:
+        from .config import MempalaceConfig
+
+        if not MempalaceConfig().hook_llm_themes:
+            return keyword_themes
+    except Exception:
+        return keyword_themes
+
+    llm_themes = _llm_themes(messages, max_themes=max_themes + 4)
+    if not llm_themes:
+        return keyword_themes
+
+    # Union, LLM-first. We don't cap the union too aggressively because
+    # diary readers can ignore extras, but truncating to 7 prevents an
+    # over-long checkpoint topic line.
+    merged: list[str] = []
+    seen: set = set()
+    for t in (*llm_themes, *keyword_themes):
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(t)
+        if len(merged) >= 7:
+            break
+    return merged
 
 
 def _save_diary_direct(

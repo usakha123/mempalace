@@ -299,6 +299,72 @@ class MempalaceConfig:
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
 
+    # ── LLM-in-hooks (gemma4 / Ollama) ─────────────────────────────────────
+    # Three independent feature gates. Defaults are ON — _get_hook_llm in
+    # hooks_cli probes Ollama once and caches "__unavailable__" if it's not
+    # running, so users without Ollama silently fall back to the keyword/
+    # mechanical paths without paying repeated probe cost. Env vars
+    # MEMPALACE_HOOK_LLM_* override the config-file values, useful for CI
+    # and disabling per-hook for one-off debugging.
+
+    def _hook_llm_bool(self, key: str, env: str, default: bool) -> bool:
+        env_val = os.environ.get(env)
+        if env_val is not None:
+            return env_val.strip().lower() in ("1", "true", "yes", "on")
+        cfg_val = self._file_config.get("hooks", {}).get(key)
+        if cfg_val is None:
+            return default
+        return bool(cfg_val)
+
+    @property
+    def hook_llm_themes(self) -> bool:
+        """Use LLM (gemma4) to extract themes in the Stop hook (Piece 2)."""
+        return self._hook_llm_bool("llm_themes", "MEMPALACE_HOOK_LLM_THEMES", True)
+
+    @property
+    def hook_llm_diary(self) -> bool:
+        """Use LLM to compose the diary checkpoint entry in the Stop hook (Piece 1)."""
+        return self._hook_llm_bool("llm_diary", "MEMPALACE_HOOK_LLM_DIARY", True)
+
+    @property
+    def hook_llm_precompact_kg(self) -> bool:
+        """Use LLM to extract KG triples during PreCompact (Piece 3)."""
+        return self._hook_llm_bool("llm_precompact_kg", "MEMPALACE_HOOK_LLM_PRECOMPACT_KG", True)
+
+    @property
+    def hook_llm_provider(self) -> str:
+        """LLM provider for hook calls. Hooks pin to Ollama by default — local-only."""
+        env_val = os.environ.get("MEMPALACE_HOOK_LLM_PROVIDER")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("hooks", {}).get("llm_provider", "ollama")).lower()
+
+    @property
+    def hook_llm_model(self) -> str:
+        """Model name passed to the hook LLM provider."""
+        env_val = os.environ.get("MEMPALACE_HOOK_LLM_MODEL")
+        if env_val:
+            return env_val.strip()
+        return str(self._file_config.get("hooks", {}).get("llm_model", "gemma4:e4b"))
+
+    @property
+    def hook_llm_timeout_s(self) -> int:
+        """Per-call timeout in seconds for hook LLM calls. Caps Stop-hook latency."""
+        env_val = os.environ.get("MEMPALACE_HOOK_LLM_TIMEOUT_S")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("hooks", {}).get("llm_timeout_s", 10)
+        try:
+            parsed = int(cfg_val)
+            return parsed if parsed > 0 else 10
+        except (TypeError, ValueError):
+            return 10
+
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""
         if "hooks" not in self._file_config:
