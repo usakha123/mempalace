@@ -11,7 +11,7 @@ name: Upstream Sync
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # daily 06:00 UTC
+    - cron: '37 6 * * *'  # daily ~06:37 UTC — top-of-hour minutes are heavily contested on GitHub-hosted runners and frequently delayed/skipped
   workflow_dispatch:       # manual trigger button on Actions tab
 
 permissions:
