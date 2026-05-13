@@ -76,6 +76,9 @@ def test_get_embedding_function_caches_by_resolved_provider_tuple(monkeypatch):
         def __init__(self, preferred_providers):
             self.preferred_providers = preferred_providers
 
+    # Force the local ONNX path — the package now auto-loads ~/.mempalace/env
+    # at import which may set MEMPALACE_EMBEDDING_PROVIDER=voyage in dev shells.
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_PROVIDER", raising=False)
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
     monkeypatch.setattr(
         embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")

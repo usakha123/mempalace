@@ -26,6 +26,14 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# Strip any inherited MEMPALACE_* env from the developer's shell.  These
+# break tests that assume a clean config baseline (palace_path, embedding
+# provider, etc.).  ``mempalace/__init__.py`` will try to load
+# ``~/.mempalace/env`` on import, but HOME is already redirected above so
+# the file does not exist and the loader is a no-op.
+for _var in [k for k in os.environ if k.startswith("MEMPALACE_")]:
+    _original_env[_var] = os.environ.pop(_var)
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
