@@ -9,43 +9,55 @@ from .version import __version__  # noqa: E402
 
 
 def _load_palace_env_file() -> None:
-    """Load ``~/.mempalace/env`` into ``os.environ`` if it exists.
+    """Load ``~/.mempalace/env`` and ``~/.mempalace/hook_env`` into ``os.environ``.
 
     Why: harnesses like Claude Code invoke ``mempalace hook run`` directly,
-    skipping the shell wrappers that source ``~/.mempalace/env``. Without
-    this loader, hook subprocesses run with an empty environment and lose
-    things like ``MEMPALACE_EMBEDDING_PROVIDER`` and ``VOYAGE_API_KEY``,
-    which makes a voyage-backed palace raise
-    "Embedding function voyage not found" on every diary checkpoint.
+    skipping the shell wrappers that would otherwise source these files.
+    Without this loader, hook subprocesses run with an empty environment
+    and lose things like ``MEMPALACE_EMBEDDING_PROVIDER``,
+    ``VOYAGE_API_KEY``, and ``ANTHROPIC_API_KEY``, which makes the palace
+    fail to add drawers or run hook-LLM calls.
 
-    Existing ``os.environ`` values always win (``setdefault``) so users who
-    deliberately override at the shell level keep their override.
+    Two files are read, in order:
+
+    * ``~/.mempalace/env`` — non-secret config (provider names, model
+      names, palace path). Also sourced by the parent shell via
+      ``~/.zshenv``, so this loader is a defensive no-op there.
+    * ``~/.mempalace/hook_env`` — hook-only secrets (API keys). This
+      file is **never** sourced by the parent shell because exporting
+      ``ANTHROPIC_API_KEY`` into Claude Code's own shell conflicts with
+      the claude.ai login token. Hook subprocesses are the right scope
+      for it, which is exactly what this loader provides.
+
+    Existing ``os.environ`` values always win (``setdefault``) so users
+    who deliberately override at the shell level keep their override.
 
     Errors are swallowed — this is a best-effort convenience, not a hard
     dependency. Malformed lines are skipped silently.
     """
-    env_file = Path(os.path.expanduser("~/.mempalace/env"))
-    if not env_file.is_file():
-        return
-    try:
-        # Tolerant parser: ``export KEY="value"``, ``export KEY=value``,
-        # or bare ``KEY=value``. Comments (#) and blank lines ignored.
-        pattern = re.compile(
-            r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
-            r'(?:"([^"]*)"|\'([^\']*)\'|([^\s#]*))\s*(?:#.*)?$'
-        )
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            m = pattern.match(line)
-            if not m:
-                continue
-            key = m.group(1)
-            val = m.group(2) or m.group(3) or m.group(4) or ""
-            os.environ.setdefault(key, val)
-    except Exception:
-        # Best-effort. A broken env file should not break ``import mempalace``.
-        pass
+    # Tolerant parser: ``export KEY="value"``, ``export KEY=value``,
+    # or bare ``KEY=value``. Comments (#) and blank lines ignored.
+    pattern = re.compile(
+        r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+        r'(?:"([^"]*)"|\'([^\']*)\'|([^\s#]*))\s*(?:#.*)?$'
+    )
+    for relpath in ("~/.mempalace/env", "~/.mempalace/hook_env"):
+        env_file = Path(os.path.expanduser(relpath))
+        if not env_file.is_file():
+            continue
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                m = pattern.match(line)
+                if not m:
+                    continue
+                key = m.group(1)
+                val = m.group(2) or m.group(3) or m.group(4) or ""
+                os.environ.setdefault(key, val)
+        except Exception:
+            # Best-effort. A broken env file should not break ``import mempalace``.
+            continue
 
 
 _load_palace_env_file()
